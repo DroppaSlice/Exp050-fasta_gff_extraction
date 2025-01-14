@@ -1,0 +1,9 @@
+﻿qseqid,sacc,name,sstart,send,sstrand
+pasA1,NC_011356.1,YYZ-2008,23705,23622,minus
+pasB,NC_049945.1,Stx2a_WGPS6,49002,48933,minus
+pasB,NC_049944.1,Stx2a_WGPS8,46112,46039,minus
+pasB,NC_011357.1,Stx2_1717,51598,51526,minus
+pasB,NC_011356.1,YYZ-2008,45153,45081,minus
+pasB,NC_049943.1,2851,48283,48211,minus
+pasC,NC_049952.1,Lambda_2B8,46151,46074,minus
+pasD1,NC_049952.1,Lambda_2B8,43836,44007,plus

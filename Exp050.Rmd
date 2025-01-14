@@ -1,0 +1,752 @@
+---
+title: "Exp050: Bacterial Genome sequence retreival and annottation tools"
+author: "Dennis Zhu"
+date: "2024-11-22"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Exp050-1: Collecting genome datasets by NCBI accession
+
+```{r 01.1-remote_blast}
+library(reticulate)
+
+py_run_file(file = "src/01.1-remote_blastn.py")
+```
+
+```{r 01.2-entrez_fetch}
+library(rentrez)
+library(readr)
+library(dplyr)
+library(seqinr)
+library(stringr)
+
+#-----reading in blast results-----#
+blast_hits <- read_tsv(file = "outputs/prok_complete_genomes_blast.txt",
+                       col_names = c("qseqid", "sseqid", "sacc", "sallacc", "pident", "length", "qcovs", "qstart", "qend", "sstart", "send", "sstrand", "evalue", "bitscore")) %>%
+#initial filtering step to remove partial hits with <75% coverage of sRNA 
+   filter(qcovs >=75)
+
+#-----pas_filter() function to filter pasA and pasD homologs-----#
+pas_filter <- function(blast_results, id_col = "qseqid", a.limit = 95, d.limit = 98){
+  list <- split(blast_results, f = blast_results[,id_col])
+  homologs <- c("pasA1", "pasA2", "pasD1", "pasD2")
+  for(gene in homologs){
+    #filter pasA1 and pasA2 dfs for >= 95% sequence identity hits
+    if(gene == "pasA1" | gene == "pasA2"){
+      list[[gene]] <- dplyr::filter(list[[gene]], pident >= 95)
+    }
+    #filter pasD1 and pasD2 dfs for >= 98% sequence identity hits
+    if(gene == "pasD1" | gene == "pasS2"){
+      list[[gene]] <- dplyr::filter(list[[gene]], pident >= 98)
+    }
+  }
+  df <- bind_rows(list)
+  return(df)
+}
+
+#-----filtering of blast results-----#
+blast_filtered <- pas_filter(blast_hits) %>%
+  select(sacc) %>%
+  unique() 
+#creating a vector of unique NCBI accessions
+unique_acc <- blast_filtered$sacc
+write(unique_acc, file = "outputs/ncbi_unique_accessions.txt")
+
+#-----splitting accessions-----#
+#rentrez has a pretty small query limit, so we split the accessions into chunks of 50 for processing
+acc_split <- split(unique_acc, ceiling(seq_along(unique_acc) / 50))
+
+#-----retrieving sequences-----#
+#initialize a list 'seqs' to hold our sequences
+seqs <- vector(mode = "list", length = length(unique_acc))
+#create an iterator k to keep track of our place in the dataset
+k <- 1
+
+#-----loop through the list of accession numbers-----#
+#first loop through elements of the list
+for(i in 1:length(acc_split)){
+  print(paste0("Processing section ", i, " of ", length(acc_split)))
+  #extract list element as a vector
+  acc_v <- acc_split[[i]]
+  #next loop through elements of the vector
+  for(j in 1:length(acc_v)){
+    print(paste0("Processing accession ", j, " from section ", i))
+    seqs[[k]] <- entrez_fetch(db = "nucleotide",
+                            id = acc_v[[j]],
+                            rettype = "fasta")
+    #advance our iterator variable
+    k <- k + 1
+  }
+}
+
+#-----cleaning up sequences-----#
+#grabbing the names
+get_names <- function(x){
+  name <- str_extract(x, pattern = ">.*\\n")
+  name <- str_remove(name, pattern = "\\n")
+  name <- str_remove(name, pattern = ">")
+}
+seq_names <- lapply(seqs, FUN = get_names)
+#removing the names from the seq list
+remove_fasta_name <- function(x){
+  y <- str_remove(x, pattern = ">.*\\n")
+  return(y)
+}
+seqs_cleaned <- lapply(seqs, remove_fasta_name)
+
+#-----writing to fasta-----#
+write.fasta(sequences = seqs_cleaned, names = seq_names, file.out = "outputs/pas_blast_genomes/ncbi_pas_genomes.fasta")
+```
+
+```{r 01.3-retrieve_assembly_accessions}
+library(readr)
+library(rentrez)
+
+#-----read and parse accessions-----#
+nuc_accessions <- read.table(file = "outputs/unique_hits.txt")
+nuc_accessions <- nuc_accessions$V1
+
+#-----script to retrieve assembly using entrez-----#
+get_acc <- function(x){
+  require(rentrez)
+  search_res <- entrez_search(db = "assembly", term = x)
+  summ <- entrez_summary(db = "assembly", id = search_res$ids)
+  #handling for multiple assembly versions
+  if(length(summ) == 55){res <- summ$assemblyaccession}
+  else if(length(summ) != 55){
+    v <- vector(mode = "character", length = length(summ))
+    for(i in 1:length(summ)){v[i] <- summ[[i]]$assemblyaccession}
+    v <- sort(v, decreasing = T)
+    res <- v[1]
+  }
+  return(res) 
+}
+#testing
+test_acc <- get_acc(nuc_accessions[1])
+
+#-----running on full list-----#
+#initialize an empty list
+ass_accessions <- vector(mode = "list", length = length(nuc_accessions))
+#loop through vector of nucleotide accessions
+for(i in 1:length(nuc_accessions)){
+  print(paste0("Processing entry ", i, " of ", length(nuc_accessions)))
+  ass_accessions[i] <- get_acc(nuc_accessions[i])
+}
+#convert results fo a vector
+accessions_v <- unlist(ass_accessions) %>%
+  unique()
+
+#-----writing accession numbers to file-----#
+write(x = accessions_v, file = "outputs/assembly_accessions.txt")
+```
+
+```{r 01.4-ncbi_datasets}
+library(reticulate)
+
+py_run_file(file = "src/01.4-ncbi_datasets.py")
+```
+
+## Exp050-2: Extracting sequence regions from ncbi genomes
+
+```{r 02.1-seq_extraction}
+library(Biostrings)
+library(dplyr)
+library(stringr)
+
+#-----reading in data-----#
+#reading genomes fastas as DNAstringset
+dna_seqs <- readDNAStringSet(filepath = "outputs/pas_blast_genomes/ncbi_pas_genomes.fasta")
+#reading metadata from blast search
+blast_metadata <- read.csv(file = "outputs/prok_complete_genomes_blast_homologFiltered.csv") %>%
+  select(qseqid, sacc, sstart, send, sstrand, length)
+
+#-----creating an input dataframe for just pasA1 hits-----#
+pasA1_df <- blast_metadata %>%
+  filter(qseqid == "pasA1") %>%
+  filter(length >= 0.75*(max(length)))
+
+names(dna_seqs) <- str_extract(names(dna_seqs), pattern = "^[^\\.]+")
+
+#-----defining new function seq_extract()-----#
+seq_extract <- function(input, seqs, upstream = 0, downstream = 0){
+  require(Biostrings)
+  #initialize vectors to hold our results and names
+  res_list <- vector(mode = "list", length = nrow(input))
+  names_v <- vector(mode = "character", length = nrow(input))
+  #iterate through the input data frame using a for loop
+  for(i in 1:nrow(input)){
+    #define the row that is being operated on in each step of the loop
+    row <- input[i,]
+    #define a few of the variables stored in that row
+    accession <- getElement(row, "sacc")
+    qseqid <- getElement(row, "qseqid")
+    sstart <- getElement(row, "sstart")
+    send <- getElement(row, "send")
+    strand <- getElement(row, "sstrand")
+    #define the specific DNA string based on the matched accession
+    dna <- seqs[[accession]]
+    upper <- length(dna)
+    #define a unique name identifier for the extracted region
+    seq_name <- paste0(accession, "_", qseqid, "_", sstart, "-up", upstream,"-down", downstream)
+    #-----error handing-----#
+    if(is.null(dna)){
+      print("Error: accession not found in DNA list")
+      stop()
+    }
+    #extracting sequences using subseq()
+    if(strand == "plus"){
+      #check ends within bounds, skip if out of bounds
+      if(sstart - upstream <= 0 | send + downstream > upper){
+        next()
+      }
+      res_list[[i]] <- subseq(dna, start = (sstart - upstream), end = (send + downstream))
+    }
+    else if(strand == "minus"){
+      #check ends within bounds, skip if out of bounds
+      if(send - upstream <=0 | sstart + downstream > upper){
+        next()
+      }
+      seq <- subseq(dna, start = (send - upstream), end = (sstart + downstream))
+      res_list[[i]] <- reverseComplement(seq)
+    }
+    #append name to the names vector
+    names_v[i] <- seq_name
+  }
+  names(res_list) <- names_v
+  res_list <- res_list[!sapply(res_list, is.null)]
+  #convert list into a more memory-efficient DNAStringSet object
+  res_set <- DNAStringSet(res_list)
+  return(res_set)
+}
+
+#-----running the seq_extract for pasA1-----#
+#just the pasA1 hit
+pasA1_set <- seq_extract(input = pasA1_df, seqs = dna_seqs)
+#1kbp flanks
+pasA1_1k <- seq_extract(input = pasA1_df, seqs = dna_seqs, upstream = 1000, downstream = 1000)
+#5kbp flanks
+pasA1_5k <- seq_extract(input = pasA1_df, seqs = dna_seqs, upstream = 5000, downstream = 5000)
+#10kbp flanks
+pasA1_10k <- seq_extract(input = pasA1_df, seqs = dna_seqs, upstream = 10000, downstream = 10000)
+
+#-----writing fastas-----#
+writeXStringSet(x = pasA1_set, filepath = "outputs/fastas/pasA1_ncbi_hits.fasta")
+writeXStringSet(x = pasA1_1k, filepath = "outputs/fastas/pasA1_ncbi_hits_1kbpFlanks.fasta")
+writeXStringSet(x = pasA1_5k, filepath = "outputs/fastas/pasA1_ncbi_hits_5kbpFlanks.fasta")
+writeXStringSet(x = pasA1_10k, filepath = "outputs/fastas/pasA1_ncbi_hits_10kbpFlanks.fasta")
+```
+
+```{r 02.2-phage_sequences}
+library(Biostrings)
+library(dplyr)
+library(stringr)
+
+#-----read phage blast hits-----#
+phage_blast <- read.csv(file = "inputs/ncbi_phage_blast.csv") %>%
+  mutate(qseqid = as.factor(qseqid))
+
+#----read Xstringset of phage genomes-----#
+phage_genomes <- readDNAStringSet(filepath = "inputs/phage_genomes/ncbi_pas_bacteriophages.fasta")
+names(phage_genomes) <- str_extract(names(phage_genomes), pattern = "[:graph:]+")
+
+#-----loading and running seq_extract()-----#
+#loading from source file
+source(file = "src/seq_extract.R")
+
+#running on phage dataset for each pas gene
+for(pas in levels(phage_blast$qseqid)){
+  phage_blast_filtered <- phage_blast %>% 
+    filter(qseqid == pas)
+  res <- seq_extract(input = phage_blast_filtered, seqs = phage_genomes, upstream = 10000, downstream = 10000)
+  file.name <- paste0(pas, "_phage_10kFlanks.fasta")
+  writeXStringSet(x = res, filepath = paste0("outputs/fastas/", file.name))
+}
+```
+
+##Exp050-3: Parsing and manipulating gff3 files
+
+```{r 03.1-one_gff}
+library(ape)
+library(microseq)
+
+#-----read gff3 using read.gff() from the 'ape' package-----#
+pasA1_phage_gff <- read.gff(file = "inputs/phage_genomes/Enterobacteria_phage_YYZ_2008.gff3") %>%
+  mutate(type = as.factor(type))
+
+#-----read blast data-----#
+phage_blast <- read.csv(file = "inputs/ncbi_phage_blast.csv") %>%
+  mutate(qseqid = as.factor(qseqid))
+
+#-----test gff extraction manually-----#
+lower <- 13622
+upper <- 33705
+pasA1_phage_gff_10k <- pasA1_phage_gff %>%
+  filter(type == "CDS") %>%
+  filter(!(end < lower | start > upper))
+  
+writeGFF(pasA1_phage_gff_10k, out.file = "outputs/gffs/YYZ_2008_pasA1_10k.gff3")
+```
+
+```{r 03.2-parsing_gffs}
+library(ape)
+library(tidyr)
+library(stringr)
+library(dplyr)
+library(microseq)
+
+#-----finding and listing gffs recursively-----#
+file_names <- list.files(path = "inputs/ncbi-dataset/data/", pattern = "*.gff", recursive = T)
+#reading gffs into an R list object
+pathname <- "inputs/ncbi-dataset/data/"
+gff_list <- vector(mode = "list", length = length(file_names))
+for(i in 1:length(file_names)){
+  print(paste0("Reading in file ", file_names[i]))
+  gff_list[[i]] <- ape::read.gff(file = paste0(pathname, file_names[i]))
+}
+names(gff_list) <- str_extract(file_names, "^[^/]+")
+
+#-----reading in blast metadata table-----#
+blast_metadata <- read.csv(file = "outputs/prok_complete_genomes_blast_homologFiltered.csv") %>%
+  select(qseqid, sacc, sstart, send, sstrand, length)
+#making another dataframe for just pasA1 hits
+pasA1_df <- blast_metadata %>%
+  filter(qseqid == "pasA1") %>%
+  filter(length >= 0.75*(max(length)))
+#write the pasA1 table
+write.csv(pasA1_df, file = "outputs/blast_tables/pasA1_blast_metadata.csv")
+
+#-----constructing ncbi accession lookup table-----#
+convert_entrez <- function(input, target_db = "assembly"){
+  e_search <- entrez_search(db = target_db, term = input)
+  e_summ <- entrez_summary(db = target_db, id = e_search$ids)
+  if(length(e_summ) == 55){
+    res <- e_summ$assemblyaccession
+  }
+  else if(length(e_summ) != 55){
+    v <- vector(mode = "character", length = length(e_summ))
+    for(i in 1:length(e_summ)){v[i] <- e_summ[[i]]$assemblyaccession}
+    v <- sort(v, decreasing = T)
+    res <- v[1]
+  }
+  #added step to deal with accession numbers not found by entrez_search()
+  if (is.null(res)){
+    res = "accession not found"
+  }
+  return(res)
+}
+#initialize a storage vector
+acc_v <- vector(mode = "character", length = nrow(pasA1_df))
+
+#loop to grab all assembly accessions for pasA1 blast hits
+for(i in 642:nrow(pasA1_df)){
+  acc_v[i] <- convert_entrez(input = pasA1_df[i,"sacc"])
+  print(paste0("Processing accession ", i, " out of ", nrow(pasA1_df)))
+}
+#append as new variable to pasA1 data frame
+pasA1_df$assembly.accession <- acc_v
+
+#-----function to access and extract from gff list using accession no.-----#
+subset_gff <- function(input, gffs, 
+                       upstream = 0, downstream = 0, 
+                       n.acc.name = "sacc", a.acc.name = "assembly.accession",
+                       strand.name = "sstrand"){
+  missing_count <- 0
+  n.acc <- input[,n.acc.name]
+  a.acc <- input[,a.acc.name]
+  strand <- input[,strand.name]
+  start <- input[,"sstart"]
+  end <- input[,"send"]
+  print(paste0("working on accession ", a.acc, " molecule ", n.acc))
+  #establishing region bounds
+  if(strand == "plus"){
+    lower = start - upstream
+    upper = end + downstream
+  }
+  else if(strand == "minus"){
+    lower = end - downstream
+    upper = start + upstream
+  }
+  #accessing the gff table by assembly accession
+  if(str_detect(a.acc, ",")){
+    v_acc <- unlist(base::strsplit(a.acc, split = ","))
+    print(paste0(length(v_acc), " accessions detected"))
+    for(acc in v_acc){
+      if(is.null(gffs[[acc]])){
+        print(paste0(acc, " is not found in gff list, skipping."))
+        next
+      }
+      else if(!is.null(gffs[[acc]])){
+        print(paste0(acc, " found in list. Processing..."))
+        df <- gffs[[acc]]
+      }
+    }
+  }
+  else if(str_detect(a.acc, ",") == F){
+    df <- gffs[[a.acc]]
+  }
+  df <- df %>%
+    #filtering based on nucleotide accession
+    filter(str_detect(seqid, n.acc)) %>%
+    #extracting features within the region
+    filter(!(end < lower | start > upper))
+  return(df)
+}
+
+#-----running gff subset function for pasA1 hits-----#
+#filter out entries that do not have a matching gff
+pasA1_df_filtered <- pasA1_df %>%
+  filter(assembly.accession %in% names(gff_list)) %>%
+  mutate(names = paste0(sacc, "_", qseqid, "_", "sstart", "-up10000-down10000"))
+
+#extracting gff list for 10k flanks
+pasA1_gffs_10k <- lapply(X = split(pasA1_df_filtered, f = seq(nrow(pasA1_df_filtered))), FUN = subset_gff, gffs = gff_list, upstream = 10000, downstream = 10000)
+names(pasA1_gffs_10k) <- pasA1_df_filtered$names
+
+#-----writing out gff files-----#
+for(i in 1:length(pasA1_gffs_10k)){
+  print(paste0("writing file ", i, " out of ", length(pasA1_gffs_10k)))
+  writeGFF(pasA1_gffs_10k[[i]], paste0("outputs/gffs/pasA1/", names(pasA1_gffs_10k[i]), ".gff3"))
+}
+```
+
+## Exp050-4: Streamlining functions and extracting sequences + gff for all Pas genes
+
+```{r 04.1-defining_functions}
+#-----seq_extract() for subsetting genome sequence based on regions-----#
+seq_extract <- function(input, seqs, upstream = 0, downstream = 0){
+  require(Biostrings)
+  #initialize vectors to hold our results and names
+  res_list <- vector(mode = "list", length = nrow(input))
+  names_v <- vector(mode = "character", length = nrow(input))
+  #iterate through the input data frame using a for loop
+  for(i in 1:nrow(input)){
+    #define the row that is being operated on in each step of the loop
+    row <- input[i,]
+    #define a few of the variables stored in that row
+    accession <- getElement(row, "sacc")
+    qseqid <- getElement(row, "qseqid")
+    sstart <- getElement(row, "sstart")
+    send <- getElement(row, "send")
+    strand <- getElement(row, "sstrand")
+    #define the specific DNA string based on the matched accession
+    dna <- seqs[[accession]]
+    upper <- length(dna)
+    #define a unique name identifier for the extracted region
+    seq_name <- paste0(accession, "_", qseqid, "_", sstart, "-up", upstream,"-down", downstream)
+    #-----error handing-----#
+    if(is.null(dna)){
+      print("Error: accession not found in DNA list")
+      stop()
+    }
+    #extracting sequences using subseq()
+    if(strand == "plus"){
+      #check ends within bounds, skip if out of bounds
+      if(sstart - upstream <= 0 | send + downstream > upper){
+        next()
+      }
+      res_list[[i]] <- subseq(dna, start = (sstart - upstream), end = (send + downstream))
+    }
+    else if(strand == "minus"){
+      #check ends within bounds, skip if out of bounds
+      if(send - upstream <=0 | sstart + downstream > upper){
+        next()
+      }
+      seq <- subseq(dna, start = (send - upstream), end = (sstart + downstream))
+      res_list[[i]] <- reverseComplement(seq)
+    }
+    #append name to the names vector
+    names_v[i] <- seq_name
+  }
+  names(res_list) <- names_v
+  res_list <- res_list[!sapply(res_list, is.null)]
+  #convert list into a more memory-efficient DNAStringSet object
+  res_set <- DNAStringSet(res_list)
+  return(res_set)
+}
+
+#-----write_fastas() function to write sequences in list to individual fastas
+write_fastas <- function(stringset, outfilepath, verbose = T){
+  for(i in 1:length(stringset)){
+    if(verbose == T){print(paste0("writing file ", i, " out of ", length(stringset)))}
+    writeXStringSet(x = stringset[i], filepath = paste0(outfilepath, names(stringset[i]), ".fasta"))
+  }
+} 
+
+#-----convert_entrez() converts nucleotide accession numbers to assembly accessions-----#
+convert_entrez <- function(input, target_db = "assembly", verbose = T){
+  require(rentrez)
+  e_search <- entrez_search(db = target_db, term = input)
+  e_summ <- entrez_summary(db = target_db, id = e_search$ids)
+  if(length(e_summ) == 55){
+    res <- e_summ$assemblyaccession
+  }
+  else if(length(e_summ) != 55){
+    v <- vector(mode = "character", length = length(e_summ))
+    for(i in 1:length(e_summ)){v[i] <- e_summ[[i]]$assemblyaccession}
+    v <- sort(v, decreasing = T)
+    res <- v[1]
+  }
+  #added step to deal with accession numbers not found by entrez_search()
+  if (is.null(res)){
+    res = "accession not found"
+  }
+  return(res)
+}
+
+#-----subset_gff() extracts regions of a gff files based on inputs-----#
+subset_gff <- function(input, gffs, 
+                       upstream = 0, downstream = 0, 
+                       n.acc.name = "sacc", a.acc.name = "assembly.accession",
+                       strand.name = "sstrand",
+                       verbose = T){
+  missing_count <- 0
+  n.acc <- input[,n.acc.name]
+  a.acc <- input[,a.acc.name]
+  strand <- input[,strand.name]
+  start <- input[,"sstart"]
+  end <- input[,"send"]
+  if(verbose == T) {print(paste0("working on accession ", a.acc, " molecule ", n.acc))}
+  #establishing region bounds
+  if(strand == "plus"){
+    lower = start - upstream
+    upper = end + downstream
+  }
+  else if(strand == "minus"){
+    lower = end - downstream
+    upper = start + upstream
+  }
+  #accessing the gff table by assembly accession
+  if(str_detect(a.acc, ",")){
+    v_acc <- unlist(base::strsplit(a.acc, split = ","))
+    print(paste0(length(v_acc), " accessions detected"))
+    for(acc in v_acc){
+      if(is.null(gffs[[acc]])){
+        print(paste0(acc, " is not found in gff list, skipping."))
+        next
+      }
+      else if(!is.null(gffs[[acc]])){
+        print(paste0(acc, " found in list. Processing..."))
+        df <- gffs[[acc]]
+      }
+    }
+  }
+  else if(str_detect(a.acc, ",") == F){
+    df <- gffs[[a.acc]]
+  }
+  df <- df %>%
+    #filtering based on nucleotide accession
+    filter(str_detect(seqid, n.acc)) %>%
+    #extracting features within the region
+    filter(!(end < lower | start > upper))
+  return(df)
+}
+
+#-----write.gff.list() function to write individual gffs from a list of named gff tables-----#
+write.gff.list <- function(gffs, outfilepath){
+  require(microseq)
+  for(i in length(gffs)){
+    writeGFF(gffs[[i]], paste0(outfilepath, names(gffs[i]), ".gff3"))
+  }
+}
+```
+
+```{r 04.2-sequence_extractions}
+library(Biostrings)
+library(dplyr)
+library(stringr)
+
+#-----reading in data-----#
+#reading genomes fastas as DNAstringset
+dna_seqs <- readDNAStringSet(filepath = "outputs/pas_blast_genomes/ncbi_pas_genomes.fasta")
+#reading metadata from blast search
+blast_metadata <- read.csv(file = "outputs/prok_complete_genomes_blast_homologFiltered.csv") %>%
+  select(qseqid, sacc, sstart, send, sstrand, length) %>%
+  mutate(qseqid = as.factor(qseqid))
+
+#-----sourcing our functions from 04.1-----#
+source(file = "src/04.1-defining_functions.R")
+
+#-----creating input dataframes for each of the pas hits-----#
+pasA2_df <- blast_metadata %>%
+  filter(qseqid == "pasA2") %>%
+  filter(length >= 0.75*max(length))
+
+#-----running scripts for pasA2-----#
+pasA2_10k <- seq_extract(input = pasA2_df, seqs = dna_seqs, upstream = 10000, downstream = 10000)
+writeXStringSet(pasA2_10k, filepath = "outputs/fastas/pasA2_ncbi_hits_10kbpFlanks.fasta")
+write_fastas(stringset = pasA2_10k, outfilepath = "outputs/fastas/pasA2/")
+
+#-----iterating scripts over remaining pas genes-----#
+pas_genes <- c("pasA1", "pasA2", "pasB", "pasC", "pasD1", "pasD2")
+
+for(gene in pas_genes){
+  print(paste0("Processing ", gene))
+  input_df <- blast_metadata %>%
+    filter(qseqid == gene) %>%
+    filter(length >= 0.75*max(length))
+  write.csv(input_df, file = paste0("outputs/blast_tables/", gene, "_blast_metadata.csv"))
+  
+  df_10k <- seq_extract(input = input_df, seqs = dna_seqs, upstream = 10000, downstream = 10000)
+  writeXStringSet(df_10k, filepath = paste0("outputs/fastas/", gene, "_ncbi_hits_10kbpFlanks.fasta"))
+  write_fastas(stringset = df_10k, outfilepath = paste0("outputs/fastas/", gene, "/"), verbose = F)
+}
+```
+
+```{r 04.3-gff_extractions}
+library(ape)
+library(tidyr)
+library(stringr)
+library(dplyr)
+library(microseq)
+library(rentrez)
+
+#-----finding and listing gffs recursively-----#
+file_names <- list.files(path = "inputs/ncbi-dataset/data/", pattern = "*.gff", recursive = T)
+#reading gffs into an R list object
+pathname <- "inputs/ncbi-dataset/data/"
+gff_list <- vector(mode = "list", length = length(file_names))
+for(i in 1:length(file_names)){
+  print(paste0("Reading in file ", file_names[i]))
+  gff_list[[i]] <- ape::read.gff(file = paste0(pathname, file_names[i]))
+}
+names(gff_list) <- str_extract(file_names, "^[^/]+")
+
+#-----sourcing our functions from 04.1-----#
+source(file = "src/04.1-defining_functions.R")
+
+#-----iterating gff extraction over all pas_genes-----#
+gene_list <- c("pasA1", "pasA2", "pasB", "pasC", "pasD1", "pasD2")
+ 
+#-----for loop to create accession number conversion tables-----#
+for(gene in gene_list){
+  print(paste0("Processing gffs for ", gene))
+  #read input metadata
+  input_df <- read.csv(file = paste0("outputs/blast_tables/", gene, "_blast_metadata.csv"))
+  
+  #create output directories
+  if(!dir.exists(paste0("outputs/gffs/", gene))) {dir.create(paste0("outputs/gffs/", gene))}
+  
+  acc_v <- vector(mode = "character", length = nrow(input_df))
+  for( i in 1:nrow(input_df)){
+    print(paste0("processing sample ", i, " out of ", nrow(input_df)))
+    acc_v[i] <- convert_entrez(input = input_df[i, "sacc"])
+  }
+  input_df$assembly.accession <- acc_v
+  write.csv(input_df, file = paste0("outputs/blast_tables/", gene, "_accession_conversion.csv"))
+}  
+
+#-----separate for loop to run the subset_gff() function-----#
+
+for(gene in gene_list){
+  print(paste0("Processing ", gene))
+  input_df_filtered <- input_df %>%
+    filter(assembly.accession %in% names(gff_list)) %>%
+    mutate(names = paste0(sacc, "_", qseqid, "_", "sstart", "-up10000-down10000"))
+  
+  print(paste0(nrow(input_df_filtered) - nrow(input_df), " accessions had no gff. The final count is ", nrow(input_df_filtered)))
+  
+  gff_10k <- lapply(X = split(input_df_filtered, f = seq(nrow(input_df_filtered))), FUN = subset_gff, gffs = gff_list, upstream = 10000, downstream = 10000)
+  names(gff_10k) <- input_df_filtered$names
+  
+  write.gff.list(gffs = gff_10k, outfilepath = paste0("outputs/gffs/", gene, "/"))
+}
+```
+
+
+```{r 04.4-phage_gffs}
+library(ape)
+library(microseq)
+
+#-----reading in phage gff files-----#
+file_names <- list.files(path = "inputs/phage_genomes/", pattern = "*.gff3", recursive = T)
+pathname <- "inputs/phage_genomes/"
+gff_list <- vector(mode = "list", length = length(file_names))
+for ( i in 1:length(file_names)){
+  print(paste0("Reading in file ", file_names[i]))
+  gff_list[[i]] <- ape::read.gff(file = paste0(pathname, file_names[i]))
+}
+names(gff_list) <- str_extract(file_names, "^[^/.]+")
+
+#-----sourcing our functions from 04.1-----#
+source(file = "src/04.1-defining_functions.R")
+
+#-----read phage blast data-----#
+phage_blast <- read.csv(file = "inputs/ncbi_phage_blast.csv") %>%
+  mutate(qseqid = as.factor(qseqid)) %>%
+  #manually add phage names to match gff list
+  mutate(phage.name = c("Enterobacteria_phage_YYZ_2008", 
+                        "Stx2a_WGPS6",
+                        "Stx2a_WGPS8",
+                        "Stx2_1717",
+                        "Enterobacteria_phage_YYZ_2008",
+                        "Enterobacteria_phage_2851",
+                        "Escherichia_virus_2B8",
+                        "Escherichia_virus_2B8")) %>%
+  mutate(names = paste0(qseqid, "_", phage.name, "_10kFlanks"))
+
+#-----lapply subset_gffs() to extract phage gffs-----#
+phage_gff_10k <- lapply(X = split(phage_blast, f = seq(nrow(phage_blast))), 
+                        FUN = subset_gff,
+                        gffs = gff_list,
+                        upstream = 10000,
+                        downstream = 10000,
+                        a.acc.name = "phage.name")
+names(phage_gff_10k) <- phage_blast$names
+
+#-----write out gffs-----#
+write.gff.list(gffs = phage_gff_10k, outfilepath = "outputs/gffs/phages/")
+```
+
+```{r 04.5-phage_fastas}
+
+```
+
+## Exp050: Extra code
+
+```{r 04.1-test_synteny}
+library(DECIPHER)
+library(Biostrings)
+
+pasA1_10k <- readDNAStringSet(filepath = "outputs/fastas/pasA1_ncbi_hits_10kbpFlanks.fasta")
+
+db <- dbConnect(SQLite(), ":memory:")
+
+Seqs2DB(seqs = pasA1_10k[1:10],
+        type = "XStringSet",
+        dbFile = db, 
+        identifier = names(pasA1_10k[1:10]))
+
+synteny <- FindSynteny(db, verbose = T)
+pasA1_10k_syn <- AlignSynteny(synteny, db, verbose = T)
+```
+
+
+```{r 01.2-Extracting accession numbers from fasta}
+library(Biostrings)
+library(dplyr)
+library(stringr)
+
+hazen_genomes <- readDNAStringSet(filepath = "inputs/compiled_fastas/Hazen2016.fasta")
+names(hazen_genomes) <- str_extract(names(hazen_genomes), pattern = "NZ_[:graph:]+")
+
+hazen_blast <- read.csv(file = "inputs/hazen_pas_blast_homologFiltered.csv") %>%
+  mutate(sseqid = str_extract(sseqid, pattern = "NZ_[^|]*"))
+
+hazen_hits <- hazen_blast$sseqid 
+
+hazen_genomes_filtered <- hazen_genomes[hazen_hits]
+  
+```
+
+```{r 01.2-testing_biomart}
+library(dplyr)
+library(biomaRt)
+
+prok_complete_genomes_blast <- read.csv(file = "inputs/prok_complete_genomes_blast_homologFiltered.csv")
+
+
+```
